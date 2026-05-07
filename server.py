@@ -134,6 +134,8 @@ class ChatServer:
                         username = self._handle_register(client_socket, message)
                     elif msg_type == 'login':
                         username = self._handle_login(client_socket, message)
+                    elif msg_type == 'check_login_policy':
+                        self._handle_check_login_policy(client_socket, message)
                     elif msg_type == 'message':
                         self._handle_chat_message(message, username)
                     elif msg_type == 'private_message':
@@ -144,6 +146,12 @@ class ChatServer:
                         self._send_group_history(client_socket, username)
                     elif msg_type == 'get_private_history':
                         self._send_private_history(client_socket, username, message)
+                    elif msg_type == 'get_unread_counts':
+                        self._handle_get_unread_counts(client_socket, username)
+                    elif msg_type == 'clear_unread':
+                        self._handle_clear_unread(username, message)
+                    elif msg_type == 'unread_increment':
+                        pass  # 客户端推送给自己的心跳，不回传服务器
                     elif msg_type == 'logout':
                         self._handle_logout(username, client_socket)
                         break
@@ -203,7 +211,7 @@ class ChatServer:
 
     def _handle_login(self, client_socket: socket.socket, message: dict) -> Optional[str]:
         """
-        处理用户登录
+        处理用户登录（支持懒人密码模式）。
 
         Args:
             client_socket: 客户端socket
@@ -214,17 +222,29 @@ class ChatServer:
         """
         username = message.get('username', '').strip()
         password = message.get('password', '')
+        skip_password = message.get('skip_password', False)
 
-        if not username or not password:
+        if not username:
             self._send_response(client_socket, {
                 'type': 'login_response',
                 'success': False,
-                'message': '用户名和密码不能为空'
+                'message': '用户名不能为空'
             })
             return None
 
-        # 验证登录
-        result = self.db.verify_login(username, password)
+        if not skip_password and not password:
+            self._send_response(client_socket, {
+                'type': 'login_response',
+                'success': False,
+                'message': '密码不能为空'
+            })
+            return None
+
+        # 懒人模式：跳过密码验证
+        if skip_password:
+            result = self.db.verify_login(username, skip_password=True)
+        else:
+            result = self.db.verify_login(username, password)
 
         if result['success']:
             # 检查是否已在线
@@ -236,12 +256,13 @@ class ChatServer:
                 })
                 return None
 
-            # 添加到在线用户列表
-            self._add_client(username, client_socket)
-            print(f"[服务器] 用户 {username} 已添加到在线列表", flush=True)
+            # 记录登录（更新今日次数）
+            policy = self.db.check_login_policy(username)
+            self.db.record_successful_login(username, policy['login_count_today'])
 
-            # 发送登录成功响应
-            print(f"[服务器] 发送登录响应给 {username}", flush=True)
+            self._add_client(username, client_socket)
+            logger.info(f"[服务器] 用户 {username} 已添加到在线列表")
+
             self._send_response(client_socket, {
                 'type': 'login_response',
                 'success': True,
@@ -249,23 +270,14 @@ class ChatServer:
                 'username': username
             })
 
-            # 确保登录响应已发送
+            # 短暂延迟确保登录响应已发送
             import time
             time.sleep(0.1)
-            print(f"[服务器] 登录响应已发送，等待后发送在线用户列表", flush=True)
 
-            # 向新登录的用户发送当前在线用户列表
-            print(f"[服务器] 发送在线用户列表给 {username}", flush=True)
             self._send_online_users(client_socket)
-
-            # 广播用户上线通知给所有其他用户
-            print(f"[服务器] 广播 {username} 上线通知", flush=True)
             self._broadcast_system_message(f"{username} 上线了", username)
-
-            # 通知所有其他客户端更新在线用户列表
             self._broadcast_online_users(exclude=username)
 
-            print(f"[服务器] 用户 {username} 登录完成", flush=True)
             logger.info(f"用户登录成功: {username}")
             return username
         else:
@@ -297,16 +309,18 @@ class ChatServer:
         # 保存到数据库
         self.db.save_message(sender, "ALL", content, "group")
 
-        # 广播给所有在线用户
+        # 广播给所有在线用户（包括发送者自身，确保发送后立即显示）
         broadcast_msg = {
             'type': 'group_message',
             'from': sender,
             'to': 'ALL',
             'content': content,
-            'timestamp': timestamp
+            'timestamp': timestamp,
+            'client_msg_id': message.get('client_msg_id', '')
         }
 
-        self._broadcast(json.dumps(broadcast_msg, ensure_ascii=False), exclude=sender)
+        # 全量广播（含发送者），发送者收到自己的消息后做去重处理
+        self._broadcast(json.dumps(broadcast_msg, ensure_ascii=False))
 
         logger.info(f"[群聊] {sender}: {content}")
 
@@ -339,11 +353,22 @@ class ChatServer:
             'from': sender,
             'to': to_user,
             'content': content,
-            'timestamp': timestamp
+            'timestamp': timestamp,
+            'client_msg_id': message.get('client_msg_id', '')
         }
 
-        # 发送给接收者
-        self._send_to_user(to_user, json.dumps(private_msg, ensure_ascii=False))
+        # 发送给接收者（若在线实时推送；若不在线只写未读计数）
+        sent = self._send_to_user(to_user, json.dumps(private_msg, ensure_ascii=False))
+        if not sent:
+            # 目标用户离线，存入未读计数
+            self.db.increment_unread(to_user, sender)
+        else:
+            # 目标用户在线，推送"增加未读"提示（用于UI徽章更新）
+            # 服务器会在用户打开/切换私聊窗口时清零该计数
+            self._send_to_user(to_user, json.dumps({
+                'type': 'unread_increment',
+                'from': sender
+            }, ensure_ascii=False))
 
         # 发送确认给发送者
         self._send_to_user(sender, json.dumps(private_msg, ensure_ascii=False))
@@ -521,6 +546,44 @@ class ChatServer:
             'messages': messages
         }
         self._send_response(client_socket, response)
+
+    def _handle_check_login_policy(self, client_socket: socket.socket, message: dict):
+        """
+        处理登录策略查询，返回本次是否需要密码。
+
+        Args:
+            client_socket: 客户端socket
+            message: 请求消息
+        """
+        username = message.get('username', '').strip()
+        if not username:
+            return
+
+        policy = self.db.check_login_policy(username)
+        self._send_response(client_socket, {
+            'type': 'login_policy',
+            'needs_password': policy['needs_password'],
+            'message': policy['message']
+        })
+
+    def _handle_get_unread_counts(self, client_socket: socket.socket,
+                                   username: Optional[str]):
+        """处理获取未读计数请求。"""
+        if not username:
+            return
+        counts = self.db.get_unread_counts(username)
+        self._send_response(client_socket, {
+            'type': 'unread_counts',
+            'counts': counts
+        })
+
+    def _handle_clear_unread(self, username: Optional[str], message: dict):
+        """处理清零未读计数请求。"""
+        if not username:
+            return
+        from_user = message.get('from_user', '').strip()
+        if from_user:
+            self.db.clear_unread(username, from_user)
 
     def _send_private_history(self, client_socket: socket.socket,
                                username: Optional[str], message: dict):

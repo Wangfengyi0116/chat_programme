@@ -65,9 +65,18 @@ class Database:
                     password TEXT NOT NULL,
                     is_online INTEGER DEFAULT 0,
                     register_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    last_login_time TIMESTAMP
+                    last_login_time TIMESTAMP,
+                    login_date TEXT,
+                    login_count_today INTEGER DEFAULT 0
                 )
             """)
+
+            # 新增 login_date / login_count_today 列（如已有表则跳过）
+            for col, col_type in [("login_date", "TEXT"), ("login_count_today", "INTEGER DEFAULT 0")]:
+                try:
+                    cursor.execute(f"ALTER TABLE users ADD COLUMN {col} {col_type}")
+                except sqlite3.OperationalError:
+                    pass  # 列已存在
 
             # 创建消息表
             cursor.execute("""
@@ -82,6 +91,17 @@ class Database:
                 )
             """)
 
+            # 未读私聊消息表（接收者、发送者、未读数）
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS unread_private_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    receiver TEXT NOT NULL,
+                    sender TEXT NOT NULL,
+                    unread_count INTEGER DEFAULT 0,
+                    UNIQUE(receiver, sender)
+                )
+            """)
+
             # 创建索引提高查询效率
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender)
@@ -91,6 +111,9 @@ class Database:
             """)
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp)
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_unread_receiver ON unread_private_messages(receiver)
             """)
 
             conn.commit()
@@ -138,13 +161,15 @@ class Database:
                 logger.error(f"用户注册失败: {e}")
                 return {"success": False, "message": f"注册失败: {e}"}
 
-    def verify_login(self, username: str, password: str) -> Dict[str, Any]:
+    def verify_login(self, username: str, password: str = None,
+                     skip_password: bool = False) -> Dict[str, Any]:
         """
-        验证用户登录
+        验证用户登录（支持懒人密码模式）。
 
         Args:
-            username: 用户名
-            password: 密码
+            username:       用户名
+            password:       密码（skip_password=False 时必填）
+            skip_password:  True=跳过密码验证（仅需用户存在），默认False
 
         Returns:
             包含success和message的字典
@@ -154,7 +179,32 @@ class Database:
                 conn = self._get_connection()
                 cursor = conn.cursor()
 
-                # 查询用户
+                if skip_password:
+                    # 懒人模式：只检查用户是否存在
+                    cursor.execute(
+                        "SELECT id FROM users WHERE username = ?",
+                        (username,)
+                    )
+                    user = cursor.fetchone()
+                    if not user:
+                        conn.close()
+                        return {"success": False, "message": "用户名不存在"}
+
+                    cursor.execute(
+                        "UPDATE users SET is_online = 1, last_login_time = ? "
+                        "WHERE username = ?",
+                        (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), username)
+                    )
+                    conn.commit()
+                    conn.close()
+                    logger.info(f"用户登录成功(免密): {username}")
+                    return {"success": True, "message": "登录成功", "username": username}
+
+                # 完整验证模式
+                if not password:
+                    conn.close()
+                    return {"success": False, "message": "密码不能为空"}
+
                 cursor.execute(
                     "SELECT id, username FROM users WHERE username = ? AND password = ?",
                     (username, password)
@@ -162,14 +212,13 @@ class Database:
                 user = cursor.fetchone()
 
                 if user:
-                    # 更新在线状态和最后登录时间
                     cursor.execute(
-                        "UPDATE users SET is_online = 1, last_login_time = ? WHERE username = ?",
+                        "UPDATE users SET is_online = 1, last_login_time = ? "
+                        "WHERE username = ?",
                         (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), username)
                     )
                     conn.commit()
                     conn.close()
-
                     logger.info(f"用户登录成功: {username}")
                     return {"success": True, "message": "登录成功", "username": username}
 
@@ -375,6 +424,138 @@ class Database:
             except sqlite3.Error as e:
                 logger.error(f"获取所有用户失败: {e}")
                 return []
+
+    # ─── 登录次数追踪（懒人密码验证） ────────────────────────────────────────
+
+    def check_login_policy(self, username: str) -> dict:
+        """
+        查询用户的今日登录策略。
+
+        Returns:
+            {
+                'needs_password': bool,      # 本次是否需要输入密码
+                'login_count_today': int,    # 今日累计登录次数（含本次）
+                'message': str
+            }
+        """
+        with self.lock:
+            try:
+                conn = self._get_connection()
+                cursor = conn.cursor()
+                today = datetime.now().strftime("%Y-%m-%d")
+
+                cursor.execute(
+                    "SELECT login_date, login_count_today FROM users WHERE username = ?",
+                    (username,)
+                )
+                row = cursor.fetchone()
+                conn.close()
+
+                if not row:
+                    return {'needs_password': True, 'login_count_today': 1,
+                            'message': '用户不存在，需要完整验证'}
+
+                login_date, count = row
+                if login_date != today:
+                    return {'needs_password': True, 'login_count_today': 1,
+                            'message': '新的一天，首次登录需要密码'}
+
+                next_count = count + 1
+                needs = (next_count % 3 == 1)
+                return {
+                    'needs_password': needs,
+                    'login_count_today': next_count,
+                    'message': '需要密码' if needs else '无需密码，直接登录'
+                }
+            except sqlite3.Error as e:
+                logger.error(f"查询登录策略失败: {e}")
+                return {'needs_password': True, 'login_count_today': 1,
+                        'message': f'查询失败: {e}'}
+
+    def record_successful_login(self, username: str, login_count: int):
+        """成功登录后，记录今日日期与累计次数。"""
+        with self.lock:
+            try:
+                conn = self._get_connection()
+                cursor = conn.cursor()
+                today = datetime.now().strftime("%Y-%m-%d")
+                cursor.execute(
+                    "UPDATE users SET login_date = ?, login_count_today = ?, "
+                    "last_login_time = ? WHERE username = ?",
+                    (today, login_count,
+                     datetime.now().strftime("%Y-%m-%d %H:%M:%S"), username)
+                )
+                conn.commit()
+                conn.close()
+            except sqlite3.Error as e:
+                logger.error(f"记录登录失败: {e}")
+
+    def verify_user_exists(self, username: str) -> bool:
+        """仅验证用户名是否存在（不验证密码）。"""
+        with self.lock:
+            try:
+                conn = self._get_connection()
+                cursor = conn.cursor()
+                cursor.execute("SELECT 1 FROM users WHERE username = ?", (username,))
+                exists = cursor.fetchone() is not None
+                conn.close()
+                return exists
+            except sqlite3.Error as e:
+                logger.error(f"验证用户存在性失败: {e}")
+                return False
+
+    # ─── 未读消息管理 ──────────────────────────────────────────────────────
+
+    def increment_unread(self, receiver: str, sender: str):
+        """接收者收到一条来自发送者的未读私聊。"""
+        with self.lock:
+            try:
+                conn = self._get_connection()
+                cursor = conn.cursor()
+                cursor.execute(
+                    "INSERT INTO unread_private_messages (receiver, sender, unread_count) "
+                    "VALUES (?, ?, 1) "
+                    "ON CONFLICT(receiver, sender) DO UPDATE SET unread_count = unread_count + 1",
+                    (receiver, sender)
+                )
+                conn.commit()
+                conn.close()
+            except sqlite3.Error as e:
+                logger.error(f"增加未读计数失败: {e}")
+
+    def clear_unread(self, receiver: str, sender: str):
+        """用户查看与某人的私聊窗口后，清零未读计数。"""
+        with self.lock:
+            try:
+                conn = self._get_connection()
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE unread_private_messages SET unread_count = 0 "
+                    "WHERE receiver = ? AND sender = ?",
+                    (receiver, sender)
+                )
+                conn.commit()
+                conn.close()
+            except sqlite3.Error as e:
+                logger.error(f"清零未读计数失败: {e}")
+
+    def get_unread_counts(self, receiver: str) -> dict:
+        """获取某用户所有未读计数，格式 {sender: count}。"""
+        with self.lock:
+            try:
+                conn = self._get_connection()
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT sender, unread_count FROM unread_private_messages "
+                    "WHERE receiver = ? AND unread_count > 0",
+                    (receiver,)
+                )
+                rows = cursor.fetchall()
+                conn.close()
+                return {row[0]: row[1] for row in rows}
+            except sqlite3.Error as e:
+                logger.error(f"获取未读计数失败: {e}")
+                return {}
 
     def close(self):
         """关闭数据库（此处无需关闭，SQLite自动管理）"""
