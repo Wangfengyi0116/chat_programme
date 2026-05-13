@@ -260,7 +260,8 @@ class ChatWindow(QMainWindow):
         if not content: return
         self.group_input.clear()
         msg_id = str(uuid.uuid4())
-        self.append_html_msg(self.group_chat_area, self.current_user, content, is_sending=True)
+        # 群聊直接显示消息，不显示发送中状态
+        self.append_html_msg(self.group_chat_area, self.current_user, content)
         self.seen_msg_ids.add(msg_id)
         self.network.send_message({'type': 'message', 'content': content, 'client_msg_id': msg_id})
 
@@ -320,7 +321,7 @@ class ChatWindow(QMainWindow):
         更新用户列表
         业务逻辑：
         - 不显示当前登录用户自己
-        - 显示其他用户的实际在线状态
+        - 显示其他用户的实际在线状态（在线/忙碌/离线）
         - 显示未读消息数量
         """
         # 缓存用户列表用于刷新
@@ -331,8 +332,12 @@ class ChatWindow(QMainWindow):
             if isinstance(u, dict):
                 name = u.get('username', '')
                 is_online = u.get('is_online', False)
-                # 根据在线状态设置显示
-                status = 'online' if is_online else 'invisible'
+                stored_status = u.get('status', '')
+                # 在线用户使用其设定状态，离线用户强制显示为离线
+                if is_online:
+                    status = stored_status if stored_status else 'online'
+                else:
+                    status = 'invisible'
             else:
                 name = u
                 status = 'invisible'
@@ -398,8 +403,13 @@ class ChatWindow(QMainWindow):
     def _switch_to_chat_session(self, username):
         """切换到指定用户的聊天窗口"""
         if username not in self.private_sessions:
+            # 创建会话
+            self._create_private_chat_session(username)
+        
+        if self._is_switching:
             return
         
+        self._is_switching = True
         self.active_private_user = username
         
         # 清除聊天容器，添加新会话
@@ -408,10 +418,14 @@ class ChatWindow(QMainWindow):
             if item.widget():
                 item.widget().hide()
         
-        self.chat_container.addWidget(self.private_sessions[username]['widget'])
+        session_widget = self.private_sessions[username]['widget']
+        self.chat_container.addWidget(session_widget)
+        session_widget.show()
         
         # 请求历史消息
         self.network.send_message({'type': 'get_private_history', 'with_user': username})
+        
+        self._is_switching = False
     
     def _send_private_message(self, username):
         """发送私聊消息"""
@@ -523,9 +537,9 @@ class ChatWindow(QMainWindow):
         """双击用户创建/切换私聊会话"""
         import time
         
-        # 防止 itemDoubleClicked 触发两次
+        # 防止重复点击
         current_time = time.time()
-        if hasattr(self, '_last_click_time') and current_time - self._last_click_time < 0.2:
+        if hasattr(self, '_last_click_time') and current_time - self._last_click_time < 0.3:
             return
         self._last_click_time = current_time
         
@@ -535,13 +549,16 @@ class ChatWindow(QMainWindow):
         else:
             username = user_data
 
-        # 如果已经在和这个用户聊天，直接返回
+        # 如果已经在和这个用户聊天，但会话可能没有显示
         if self.active_private_user == username:
+            # 确保会话存在并显示
+            if username in self.private_sessions:
+                self.private_sessions[username]['widget'].show()
             return
 
         # 清除该用户的未读计数
         self.unread_counts[username] = 0
-        self.update_user_list(self._current_users)  # 刷新显示
+        self.update_user_list(self._current_users)
 
         # 如果会话不存在，创建新会话
         if username not in self.private_sessions:

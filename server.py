@@ -444,10 +444,6 @@ class ChatServer:
     def _broadcast(self, message: str, exclude: Optional[str] = None):
         """
         广播消息给所有在线用户
-
-        Args:
-            message: 消息内容
-            exclude: 要排除的用户名
         """
         with self.clients_lock:
             clients_copy = list(self.clients.items())

@@ -78,9 +78,6 @@ class Database:
                 except sqlite3.OperationalError:
                     pass  # 列已存在
 
-            # 迁移逻辑：将所有用户的状态统一设置为 'invisible'（离线）
-            cursor.execute("UPDATE users SET status = 'invisible' WHERE status IS NULL OR status = 'online'")
-
             # 创建消息表
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS messages (
