@@ -72,11 +72,14 @@ class Database:
             """)
 
             # 新增 login_date / login_count_today / status 列（如已有表则跳过）
-            for col, col_type in [("login_date", "TEXT"), ("login_count_today", "INTEGER DEFAULT 0"), ("status", "TEXT DEFAULT 'online'")]:
+            for col, col_type in [("login_date", "TEXT"), ("login_count_today", "INTEGER DEFAULT 0"), ("status", "TEXT DEFAULT 'invisible'")]:
                 try:
                     cursor.execute(f"ALTER TABLE users ADD COLUMN {col} {col_type}")
                 except sqlite3.OperationalError:
                     pass  # 列已存在
+
+            # 迁移逻辑：将所有用户的状态统一设置为 'invisible'（离线）
+            cursor.execute("UPDATE users SET status = 'invisible' WHERE status IS NULL OR status = 'online'")
 
             # 创建消息表
             cursor.execute("""
@@ -191,7 +194,7 @@ class Database:
                         return {"success": False, "message": "用户名不存在"}
 
                     cursor.execute(
-                        "UPDATE users SET is_online = 1, last_login_time = ? "
+                        "UPDATE users SET is_online = 1, last_login_time = ?, status = 'online' "
                         "WHERE username = ?",
                         (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), username)
                     )
@@ -213,7 +216,7 @@ class Database:
 
                 if user:
                     cursor.execute(
-                        "UPDATE users SET is_online = 1, last_login_time = ? "
+                        "UPDATE users SET is_online = 1, last_login_time = ?, status = 'online' "
                         "WHERE username = ?",
                         (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), username)
                     )
@@ -439,7 +442,29 @@ class Database:
                 cursor.execute("SELECT username, is_online, status FROM users ORDER BY register_time DESC")
                 rows = cursor.fetchall()
                 conn.close()
-                return [{'username': row[0], 'is_online': bool(row[1]), 'status': row[2] or 'online'} for row in rows]
+                
+                result = []
+                for row in rows:
+                    username = row[0]
+                    is_online = bool(row[1])
+                    stored_status = row[2]
+                    
+                    # 核心逻辑：如果用户不在线，强制返回离线状态
+                    # 只有在线用户才使用其设定的状态
+                    if is_online:
+                        # 在线用户使用其设定状态，默认为在线
+                        status = stored_status if stored_status else 'online'
+                    else:
+                        # 离线用户必须显示为离线
+                        status = 'invisible'
+                    
+                    result.append({
+                        'username': username,
+                        'is_online': is_online,
+                        'status': status
+                    })
+                
+                return result
 
             except sqlite3.Error as e:
                 logger.error(f"获取所有用户状态失败: {e}")

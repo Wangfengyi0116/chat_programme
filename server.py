@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 # 服务器配置
 HOST = '0.0.0.0'  # 监听所有网络接口
-PORT = 8888       # 监听端口
+PORT = 8889       # 监听端口
 BUFFER_SIZE = 4096  # 接收缓冲区大小
 
 
@@ -387,6 +387,7 @@ class ChatServer:
         """
         if username:
             self._remove_client(username)
+            self.db.set_user_status(username, 'invisible')  # 登出时设置为离线
             self._broadcast_system_message(f"{username} 离线了", username)
             # 通知所有客户端更新在线用户列表
             self._broadcast_online_users()
@@ -418,6 +419,7 @@ class ChatServer:
         with self.clients_lock:
             self.clients[username] = (client_socket, None)
             self.db.set_user_online(username, True)
+            self.db.set_user_status(username, 'online')  # 登录时自动设置为在线
 
         logger.info(f"用户加入在线列表: {username}")
 
