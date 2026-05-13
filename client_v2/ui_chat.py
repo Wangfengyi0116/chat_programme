@@ -30,6 +30,9 @@ class ChatWindow(QMainWindow):
         self.active_private_user = None
         # 未读消息计数：{username: count}
         self.unread_counts = {}
+        self._is_switching = False  # 防止重复切换
+        self._last_click_time = 0  # 上次点击时间，用于区分单击和双击
+        self._current_users = []  # 当前用户列表缓存
         
         self.setup_ui()
         self.connect_signals()
@@ -135,17 +138,18 @@ class ChatWindow(QMainWindow):
         user_layout = QVBoxLayout()
         user_layout.addWidget(QLabel('我的伙伴们'))
         self.user_list = QListWidget()
+        self.user_list.setMinimumWidth(150)
         self.user_list.setMaximumWidth(200)
-        self.user_list.itemClicked.connect(self.on_user_selected)
+        self.user_list.itemDoubleClicked.connect(self.on_user_selected)
         user_layout.addWidget(self.user_list)
         self.private_layout.addLayout(user_layout)
         
         # 聊天区域容器（右侧）
         self.chat_container = QVBoxLayout()
-        placeholder_lbl = QLabel('← 点击左边的小伙伴开始私聊')
+        placeholder_lbl = QLabel('← 双击左边的小伙伴开始私聊')
         placeholder_lbl.setStyleSheet('color: #87CEFA; font-weight: normal;')
         self.chat_container.addWidget(placeholder_lbl)
-        self.private_layout.addLayout(self.chat_container)
+        self.private_layout.addLayout(self.chat_container, 1)  # 右侧拉伸占满剩余空间
         
         self.tabs.addTab(private_tab, '💌 悄悄话')
 
@@ -214,20 +218,41 @@ class ChatWindow(QMainWindow):
         self.network.groupHistory.connect(self.on_group_history)
         self.network.privateMessage.connect(self.on_private_msg)
         self.network.privateHistory.connect(self.on_private_history)
+        self.network.offlinePrivateMessages.connect(self.on_offline_private_messages)
 
     def append_html_msg(self, text_edit, sender, content, is_sending=False, is_confirmed=False):
         avatar = get_avatar(sender)
-        color = "#4169E1" if sender == self.current_user else "#20B2AA"
+        is_me = sender == self.current_user
+        
         if is_sending:
             status = " <i style='color:#999; font-size:12px;'>(发送中...)</i>"
         elif is_confirmed:
             status = " <i style='color:#4CAF50; font-size:12px;'>✓ 已发送</i>"
         else:
             status = ""
-        msg_html = "<div style='margin: 8px 0;'>"
-        msg_html += "<span style='color:" + color + "; font-weight:bold; font-size:15px;'>" + avatar + " " + sender + status + "</span><br>"
-        msg_html += "<span style='background-color:#E6F2FF; color:#333; font-size:14px; padding:4px; border-radius:4px;'>&nbsp;" + content + "&nbsp;</span>"
-        msg_html += "</div><br>"
+        
+        if is_me:
+            # 自己的消息显示在右边，浅蓝色背景
+            msg_html = f"""
+            <div style='margin: 6px 0; display:flex; flex-direction:column; align-items:flex-end;'>
+                <span style='color:#4169E1; font-weight:bold; font-size:13px;'>{sender} {avatar}</span>
+                <span style='background-color:#B4D7FF; color:#1a1a1a; font-size:14px; padding:8px 14px; border-radius:14px; line-height:1.4; margin-top:4px; display:inline-block;'>
+                    {content}
+                </span>
+                <span style='color:#999; font-size:11px; margin-top:2px;'>{status}</span>
+            </div>
+            """
+        else:
+            # 对方的消息显示在左边，浅灰色背景
+            msg_html = f"""
+            <div style='margin: 6px 0; display:flex; flex-direction:column; align-items:flex-start;'>
+                <span style='color:#20B2AA; font-weight:bold; font-size:13px;'>{avatar} {sender}</span>
+                <span style='background-color:#E8E8E8; color:#333; font-size:14px; padding:8px 14px; border-radius:14px; line-height:1.4; margin-top:4px; display:inline-block;'>
+                    {content}
+                </span>
+                <span style='color:#999; font-size:11px; margin-top:2px;'>{status}</span>
+            </div>
+            """
         text_edit.append(msg_html)
 
     def on_group_send(self):
@@ -269,51 +294,68 @@ class ChatWindow(QMainWindow):
             content = msg.get('content', '')
             self._append_private_message(other_user, sender, content)
 
+    def on_offline_private_messages(self, sender, messages):
+        """处理离线期间的私聊消息"""
+        if not messages:
+            return
+        
+        # 为发送者创建会话（如果不存在）
+        if sender not in self.private_sessions:
+            self._create_private_chat_session(sender)
+        
+        # 在聊天窗口显示离线消息
+        for msg in messages:
+            content = msg.get('content', '')
+            self._append_private_message(sender, sender, content)
+        
+        # 增加未读计数（因为还没有打开这个聊天窗口）
+        if sender != self.active_private_user:
+            if sender not in self.unread_counts:
+                self.unread_counts[sender] = 0
+            self.unread_counts[sender] += len(messages)
+            self.update_user_list(self._current_users)
+
     def update_user_list(self, users):
         """
         更新用户列表
         业务逻辑：
         - 不显示当前登录用户自己
-        - 其他所有用户显示为离线（白色）
+        - 显示其他用户的实际在线状态
+        - 显示未读消息数量
         """
+        # 缓存用户列表用于刷新
+        self._current_users = users
+        
         self.user_list.clear()
         for u in users:
             if isinstance(u, dict):
                 name = u.get('username', '')
+                is_online = u.get('is_online', False)
+                # 根据在线状态设置显示
+                status = 'online' if is_online else 'invisible'
             else:
                 name = u
+                status = 'invisible'
 
             # 不显示当前登录用户自己
             if name == self.current_user:
                 continue
 
-            # 所有其他用户都显示为离线
-            status = 'invisible'
-
             status_info = STATUS_COLORS.get(status, STATUS_COLORS['invisible'])
-            item = QListWidgetItem(f"{get_avatar(name)}  {name}  {status_info['dot']}")
+            
+            # 获取未读消息数量
+            unread = self.unread_counts.get(name, 0)
+            
+            # 构建显示文本
+            display_text = f"{get_avatar(name)}  {name}  {status_info['dot']}"
+            if unread > 0:
+                display_text = f"{get_avatar(name)}  {name}  {status_info['dot']}  🔴{unread}"
+            
+            item = QListWidgetItem(display_text)
             item.setData(Qt.ItemDataRole.UserRole, {'username': name, 'status': status})
             item.setForeground(QColor(status_info['color']))
             self.user_list.addItem(item)
 
-    def on_user_selected(self, item):
-        """点击用户创建/切换私聊会话"""
-        user_data = item.data(Qt.ItemDataRole.UserRole)
-        if isinstance(user_data, dict):
-            username = user_data.get('username', '')
-        else:
-            username = user_data
-        
-        # 清除该用户的未读计数
-        self.unread_counts[username] = 0
-        
-        # 如果会话不存在，创建新会话
-        if username not in self.private_sessions:
-            self._create_private_chat_session(username)
-        
-        # 切换到该用户的聊天窗口
-        self._switch_to_chat_session(username)
-    
     def _create_private_chat_session(self, username):
         """为用户创建私聊会话"""
         session_widget = QWidget()
@@ -433,6 +475,7 @@ class ChatWindow(QMainWindow):
             if sender not in self.unread_counts:
                 self.unread_counts[sender] = 0
             self.unread_counts[sender] += 1
+            self.update_user_list(self._current_users)  # 刷新用户列表显示未读数
             self.update_unread_badge()
             # 显示提醒
             self.show_new_message_notification(sender, content)
@@ -472,23 +515,44 @@ class ChatWindow(QMainWindow):
                 QTimer.singleShot(3000, lambda: item.setBackground(QColor('transparent')))
                 break
 
+    def on_user_clicked(self, item):
+        """点击用户选中（用于高亮等）"""
+        pass
+
     def on_user_selected(self, item):
-        """点击用户创建/切换私聊会话"""
+        """双击用户创建/切换私聊会话"""
+        import time
+        
+        # 防止 itemDoubleClicked 触发两次
+        current_time = time.time()
+        if hasattr(self, '_last_click_time') and current_time - self._last_click_time < 0.2:
+            return
+        self._last_click_time = current_time
+        
         user_data = item.data(Qt.ItemDataRole.UserRole)
         if isinstance(user_data, dict):
             username = user_data.get('username', '')
         else:
             username = user_data
-        
+
+        # 如果已经在和这个用户聊天，直接返回
+        if self.active_private_user == username:
+            return
+
         # 清除该用户的未读计数
         self.unread_counts[username] = 0
-        
+        self.update_user_list(self._current_users)  # 刷新显示
+
         # 如果会话不存在，创建新会话
         if username not in self.private_sessions:
             self._create_private_chat_session(username)
-        
+
         # 切换到该用户的聊天窗口
         self._switch_to_chat_session(username)
-        
+
         # 切换到私聊标签
         self.tabs.setCurrentIndex(1)
+    
+    def _execute_user_selection(self):
+        """执行用户选择（保留用于将来扩展）"""
+        pass

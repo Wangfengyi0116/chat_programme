@@ -280,6 +280,11 @@ class ChatServer:
             self._broadcast_system_message(f"{username} 上线了", username)
             self._broadcast_online_users(exclude=username)
 
+            # 发送离线期间的群聊历史记录
+            self._send_group_history(client_socket, username)
+            # 发送离线期间的未读私聊消息
+            self._send_offline_messages(client_socket, username)
+
             logger.info(f"用户登录成功: {username}")
             return username
         else:
@@ -548,6 +553,36 @@ class ChatServer:
             'messages': messages
         }
         self._send_response(client_socket, response)
+
+    def _send_offline_messages(self, client_socket: socket.socket, username: str):
+        """
+        发送用户离线期间的未读私聊消息
+
+        Args:
+            client_socket: 客户端socket
+            username: 用户名
+        """
+        if not username:
+            return
+
+        # 获取发给该用户的所有未读私聊消息
+        messages = self.db.get_offline_private_messages(username)
+        
+        # 按发送者分组发送
+        from collections import defaultdict
+        by_sender = defaultdict(list)
+        for msg in messages:
+            by_sender[msg['sender']].append(msg)
+
+        for sender, msgs in by_sender.items():
+            response = {
+                'type': 'offline_private_messages',
+                'from': sender,
+                'messages': msgs
+            }
+            self._send_response(client_socket, response)
+        
+        logger.info(f"已发送 {len(messages)} 条离线私聊消息给 {username}")
 
     def _handle_check_login_policy(self, client_socket: socket.socket, message: dict):
         """

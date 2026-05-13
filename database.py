@@ -376,6 +376,38 @@ class Database:
                 logger.error(f"获取私聊消息失败: {e}")
                 return []
 
+    def get_offline_private_messages(self, username: str, limit: int = 100) -> List[Dict[str, Any]]:
+        """
+        获取发给指定用户的所有离线私聊消息
+
+        Args:
+            username: 用户名
+            limit: 返回消息数量上限
+
+        Returns:
+            消息列表
+        """
+        with self.lock:
+            try:
+                conn = self._get_connection()
+                cursor = conn.cursor()
+                cursor.execute(
+                    """SELECT id, sender, receiver, content, message_type, timestamp
+                       FROM messages
+                       WHERE message_type = 'private'
+                       AND receiver = ?
+                       ORDER BY timestamp ASC
+                       LIMIT ?""",
+                    (username, limit)
+                )
+                messages = [dict(row) for row in cursor.fetchall()]
+                conn.close()
+                return messages
+
+            except sqlite3.Error as e:
+                logger.error(f"获取离线私聊消息失败: {e}")
+                return []
+
     def get_user_messages(self, username: str, limit: int = 50) -> List[Dict[str, Any]]:
         """
         获取某用户相关的所有消息（私聊）

@@ -18,12 +18,13 @@ class ClientApp:
     def on_login_response(self, success, msg, username):
         print(f'Login response: success={success}, msg={msg}, username={username}')
         if success:
-            # 登录成功后保留登录窗口，创建新的聊天窗口和网络连接
+            # 登录成功后保留当前网络连接，创建聊天窗口
+            # 重要：不要创建新的 NetworkClient，原连接已经与服务器建立了会话
             self.chat_window = ChatWindow(self.network, username)
             self.chat_window.show()
             # 重置登录窗口以供下次使用
             self.login_window.reset()
-            # 创建新的网络连接用于下次登录
+            # 创建新的网络连接用于下次登录（用户下次登录时使用）
             self.network = NetworkClient()
             self.login_window.set_network(self.network)
             self.network.loginResponse.connect(self.on_login_response)

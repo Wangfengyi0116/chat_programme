@@ -19,6 +19,7 @@ class NetworkClient(QObject):
     loginPolicy = pyqtSignal(bool, str)
     unreadCounts = pyqtSignal(dict)
     unreadIncrement = pyqtSignal(str)
+    offlinePrivateMessages = pyqtSignal(str, list)
     disconnected = pyqtSignal()
     reconnected = pyqtSignal()  # 重连成功信号
 
@@ -140,3 +141,4 @@ class NetworkClient(QObject):
         elif msg_type == 'login_policy': self.loginPolicy.emit(message.get('needs_password', True), message.get('message', ''))
         elif msg_type == 'unread_counts': self.unreadCounts.emit(message.get('counts', {}))
         elif msg_type == 'unread_increment': self.unreadIncrement.emit(message.get('from', ''))
+        elif msg_type == 'offline_private_messages': self.offlinePrivateMessages.emit(message.get('from', ''), message.get('messages', []))
