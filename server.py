@@ -152,6 +152,8 @@ class ChatServer:
                         self._handle_clear_unread(username, message)
                     elif msg_type == 'unread_increment':
                         pass  # 客户端推送给自己的心跳，不回传服务器
+                    elif msg_type == 'change_status':
+                        self._handle_change_status(username, message)
                     elif msg_type == 'logout':
                         self._handle_logout(username, client_socket)
                         break
@@ -491,43 +493,41 @@ class ChatServer:
 
     def _send_online_users(self, client_socket: socket.socket):
         """
-        发送在线用户列表给客户端
+        发送所有用户列表给客户端（包含在线状态）
 
         Args:
             client_socket: 客户端socket
         """
-        with self.clients_lock:
-            online_users = list(self.clients.keys())
-
+        all_users = self.db.get_all_users_with_status()
         response = {
-            'type': 'online_users',
-            'users': online_users
+            'type': 'user_list',
+            'users': all_users
         }
         self._send_response(client_socket, response)
 
     def _broadcast_online_users(self, exclude: Optional[str] = None):
         """
-        广播在线用户列表给所有客户端（用于通知更新）
+        广播用户列表给所有客户端（用于通知更新）
 
         Args:
             exclude: 要排除的用户名
         """
-        with self.clients_lock:
-            online_users = list(self.clients.keys())
-            clients_copy = list(self.clients.items())
-
+        all_users = self.db.get_all_users_with_status()
         response = {
-            'type': 'online_users',
-            'users': online_users
+            'type': 'user_list',
+            'users': all_users
         }
         response_json = json.dumps(response, ensure_ascii=False)
+
+        with self.clients_lock:
+            clients_copy = list(self.clients.items())
 
         for username, (client_socket, _) in clients_copy:
             if username != exclude:
                 try:
                     client_socket.send((response_json + '\n').encode('utf-8'))
                 except Exception as e:
-                    logger.error(f"广播在线用户列表给 {username} 失败: {e}")
+                    logger.error(f"广播用户列表给 {username} 失败: {e}")
 
     def _send_group_history(self, client_socket: socket.socket, username: Optional[str]):
         """
@@ -609,6 +609,17 @@ class ChatServer:
             'messages': messages
         }
         self._send_response(client_socket, response)
+
+    def _handle_change_status(self, username: Optional[str], message: dict):
+        """处理用户状态变更"""
+        if not username:
+            return
+        status = message.get('status', 'online')
+        if status not in ('online', 'busy', 'invisible'):
+            return
+        self.db.set_user_status(username, status)
+        # 广播更新后的用户列表给所有客户端
+        self._broadcast_online_users()
 
     def stop(self):
         """停止服务器"""

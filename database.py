@@ -71,8 +71,8 @@ class Database:
                 )
             """)
 
-            # 新增 login_date / login_count_today 列（如已有表则跳过）
-            for col, col_type in [("login_date", "TEXT"), ("login_count_today", "INTEGER DEFAULT 0")]:
+            # 新增 login_date / login_count_today / status 列（如已有表则跳过）
+            for col, col_type in [("login_date", "TEXT"), ("login_count_today", "INTEGER DEFAULT 0"), ("status", "TEXT DEFAULT 'online'")]:
                 try:
                     cursor.execute(f"ALTER TABLE users ADD COLUMN {col} {col_type}")
                 except sqlite3.OperationalError:
@@ -424,6 +424,49 @@ class Database:
             except sqlite3.Error as e:
                 logger.error(f"获取所有用户失败: {e}")
                 return []
+
+    def get_all_users_with_status(self) -> List[Dict[str, Any]]:
+        """
+        获取所有用户及其在线状态
+
+        Returns:
+            [{'username': str, 'is_online': bool, 'status': str}, ...]
+        """
+        with self.lock:
+            try:
+                conn = self._get_connection()
+                cursor = conn.cursor()
+                cursor.execute("SELECT username, is_online, status FROM users ORDER BY register_time DESC")
+                rows = cursor.fetchall()
+                conn.close()
+                return [{'username': row[0], 'is_online': bool(row[1]), 'status': row[2] or 'online'} for row in rows]
+
+            except sqlite3.Error as e:
+                logger.error(f"获取所有用户状态失败: {e}")
+                return []
+
+    def set_user_status(self, username: str, status: str):
+        """
+        设置用户状态（online/busy/invisible）
+
+        Args:
+            username: 用户名
+            status: 状态
+        """
+        with self.lock:
+            try:
+                conn = self._get_connection()
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE users SET status = ? WHERE username = ?",
+                    (status, username)
+                )
+                conn.commit()
+                conn.close()
+                logger.info(f"用户状态更新: {username} - {status}")
+
+            except sqlite3.Error as e:
+                logger.error(f"更新用户状态失败: {e}")
 
     # ─── 登录次数追踪（懒人密码验证） ────────────────────────────────────────
 

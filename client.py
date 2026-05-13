@@ -176,7 +176,8 @@ class ChatClient:
             'group_message': self._handle_group_message,
             'private_message': self._handle_private_message,
             'system_message': self._handle_system_message,
-            'online_users': self._handle_online_users,
+            'online_users': self._handle_user_list,  # 兼容旧消息类型
+            'user_list': self._handle_user_list,
             'login_response': self._handle_login_response,
             'register_response': self._handle_register_response,
             'group_history': self._handle_group_history,
@@ -229,15 +230,17 @@ class ChatClient:
         if self.message_callback and self.window:
             self.window.after(0, lambda m=msg_data: self.message_callback(m, ''))
 
-    def _handle_online_users(self, message: dict):
-        """处理在线用户列表更新"""
-        import sys
+    def _handle_user_list(self, message: dict):
+        """处理所有用户列表（包含在线状态）"""
         users = message.get('users', [])
-        print(f"[客户端 _handle_online_users] 收到在线用户列表: {users}", file=sys.stderr)
-        print(f"[客户端 _handle_online_users] self.window={self.window}, self.online_users_callback={self.online_users_callback}", file=sys.stderr)
-        self.online_users = users
+        user_list = []
+        for u in users:
+            if isinstance(u, dict):
+                user_list.append(u)
+            else:
+                user_list.append({'username': u, 'is_online': True, 'status': 'online'})
+        self.online_users = user_list
         if self.online_users_callback and self.window:
-            print(f"[客户端 _handle_online_users] 调用回调函数", file=sys.stderr)
             self.window.after(0, lambda: self.online_users_callback(self.online_users))
 
     def _handle_login_response(self, message: dict):
@@ -668,9 +671,9 @@ class ChatClient:
         self.window.minsize(700, 560)
         self.window.configure(bg='#eceff1')
 
-        # 输入框使用固定像素高度（15px ≈ 10pt字体无内边距）
-        entry_font = ("Microsoft YaHei", 10)
-        self._entry_h = _font_height(self.window, entry_font)
+        # 输入框使用固定像素高度（比背景高度略小一点）
+        entry_font = ("Microsoft YaHei", 14)
+        self._entry_h = _font_height(self.window, entry_font) + 6
 
         # ── 持久化历史记录 ──────────────────────────────────────────
         self._group_history: list = []      # 群聊消息列表（不重复）
@@ -702,8 +705,13 @@ class ChatClient:
             font=("Microsoft YaHei", 15, "bold"),
             bg='#1976d2', fg='white').pack(side='left', pady=14)
 
-        tk.Label(top_frame, text="● 在线",
-            font=("Arial", 10), bg='#1976d2', fg='#90ee90').pack(side='left', padx=8, pady=14)
+        # 状态选择按钮（可点击切换状态）
+        self._current_status = 'online'
+        self._status_label = tk.Label(top_frame, text="● 在线",
+            font=("Arial", 10), bg='#1976d2', fg='#90ee90',
+            cursor='hand2')
+        self._status_label.pack(side='left', padx=8, pady=14)
+        self._status_label.bind('<Button-1>', lambda e: self._show_status_menu(e))
 
         tk.Button(top_frame, text="刷新用户", command=self.request_online_users,
             bg='#e3e8ee', fg='#546e7a', relief='flat', cursor='hand2',
@@ -792,21 +800,21 @@ class ChatClient:
         input_frame.pack(fill='x', side='bottom', padx=10, pady=(0, 10))
         input_frame.pack_propagate(False)
 
-        self._group_input = tk.Entry(input_frame, font=("Microsoft YaHei", 10),
+        self._group_input = tk.Entry(input_frame, font=("Microsoft YaHei", 14),
             bg='#f8f8f8', fg='#333333', insertbackground='#1976d2',
-            relief='solid', bd=1, highlightthickness=1,
-            highlightcolor='#2196f3', highlightbackground='#e0e0e0')
+            relief='flat', bd=0,
+            highlightthickness=2, highlightcolor='#2196f3')
         self._group_input.pack(side='left', fill='x', expand=True,
-            ipady=0, padx=(10, 6), pady=(7, 7))
+            ipady=5, padx=(10, 6), pady=(2, 2))
         # 发送保护：防止 Enter 和按钮同时触发
         self._group_sending = False
         self._group_input.bind('<Return>', lambda e: self._do_send_group())
         self._group_send_btn = tk.Button(input_frame, text="发 送",
             bg='#2196f3', fg='white', relief='flat', cursor='hand2',
-            font=("Microsoft YaHei", 10, "bold"), width=8,
+            font=("Microsoft YaHei", 14, "bold"), width=8,
             activebackground='#1565c0', activeforeground='white',
-            bd=0, pady=4)
-        self._group_send_btn.pack(side='right', padx=(0, 4), pady=7)
+            bd=0, pady=0, height=5)
+        self._group_send_btn.pack(side='right', padx=(0, 4), pady=10)
 
     def _do_send_group(self):
         """实际执行群聊发送（带防重复保护）"""
@@ -953,35 +961,73 @@ class ChatClient:
         self._refresh_user_buttons()
         self._update_private_tab_badge()
 
+    def _show_status_menu(self, event):
+        """显示状态选择菜单"""
+        menu = tk.Menu(self.window, tearoff=0)
+        for s, c, t in [('online', '#90ee90', '● 在线'), ('busy', '#ff9800', '● 忙碌'), ('invisible', '#9e9e9e', '● 隐身')]:
+            menu.add_command(label=t, foreground=c, command=lambda ss=s, cc=c, tt=t: self._change_status(ss, cc, tt))
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _change_status(self, status, color, text):
+        """切换在线状态"""
+        self._current_status = status
+        self._status_label.config(text=text, fg=color)
+        self.send_message({'type': 'change_status', 'status': status})
+
     def _refresh_user_buttons(self):
         """刷新用户列表按钮（带/不带徽章）"""
         for widget in self._users_list_frame.winfo_children():
             widget.destroy()
 
         for user in self.online_users:
-            if user == self.username:
+            if isinstance(user, dict):
+                uname = user.get('username', '')
+            else:
+                uname = user
+            if uname == self.username:
                 continue
             self._make_user_button(user)
 
         # 更新空状态提示可见性
-        has_users = any(u != self.username for u in self.online_users)
+        has_users = any((u.get('username') if isinstance(u, dict) else u) != self.username for u in self.online_users)
         self._no_user_label.pack_forget() if has_users else self._no_user_label.pack(pady=20)
 
-    def _make_user_button(self, user: str):
+    def _make_user_button(self, user):
         """为单个用户创建带/不带徽章的按钮"""
-        unread = self._unread_counts.get(user, 0)
-        is_active = (user == self._active_private_user)
+        if isinstance(user, dict):
+            uname = user.get('username', '')
+            is_online = user.get('is_online', False)
+            status = user.get('status', 'online')
+        else:
+            uname = user
+            is_online = True
+            status = 'online'
+
+        unread = self._unread_counts.get(uname, 0)
+        is_active = (uname == self._active_private_user)
         bg = '#e3f2fd' if is_active else '#f5f5f5'
-        fg = '#1565c0' if is_active else '#2e7d32'
+
+        # 根据在线状态和用户状态设置颜色
+        if is_active:
+            fg = '#1565c0'
+        elif is_online:
+            if status == 'busy':
+                fg = '#ff9800'  # 橙色-忙碌
+            elif status == 'invisible':
+                fg = '#9e9e9e'  # 灰色-隐身
+            else:
+                fg = '#2e7d32'  # 绿色-在线
+        else:
+            fg = '#9e9e9e'  # 离线灰色
 
         container = tk.Frame(self._users_list_frame, bg=bg)
         container.pack(fill='x', pady=1)
 
-        name_label = tk.Label(container, text=f"  {user}",
+        name_label = tk.Label(container, text=f"  {uname}",
             font=("Microsoft YaHei", 10), bg=bg, fg=fg,
             cursor='hand2', anchor='w')
         name_label.pack(side='left', fill='x', expand=True, ipady=6)
-        name_label.bind('<Button-1>', lambda e, u=user: self._open_private_chat(u))
+        name_label.bind('<Button-1>', lambda e, u=uname: self._open_private_chat(u))
         name_label.bind('<Enter>', lambda e, lbl=name_label: lbl.config(bg='#e8f5e9'))
         name_label.bind('<Leave>',
             lambda e, lbl=name_label, b=bg: lbl.config(bg=b))
@@ -1048,12 +1094,12 @@ class ChatClient:
         input_f.pack(fill='x', padx=10, pady=(0, 10))
         input_f.pack_propagate(False)
 
-        self._private_input = tk.Entry(input_f, font=("Microsoft YaHei", 10),
+        self._private_input = tk.Entry(input_f, font=("Microsoft YaHei", 14),
             bg='#f8f8f8', fg='#333333', insertbackground='#1976d2',
-            relief='solid', bd=1, highlightthickness=1,
-            highlightcolor='#2196f3', highlightbackground='#e0e0e0')
+            relief='flat', bd=0,
+            highlightthickness=2, highlightcolor='#2196f3')
         self._private_input.pack(side='left', fill='x', expand=True,
-            ipady=0, padx=(10, 6), pady=(7, 7))
+            ipady=5, padx=(10, 6), pady=(2, 2))
         self._private_sending = False
         self._private_input.bind('<Return>',
             lambda e: self._do_send_private(user))
@@ -1061,9 +1107,9 @@ class ChatClient:
         tk.Button(input_f, text="发 送",
             command=lambda: self._do_send_private(user),
             bg='#2196f3', fg='white', relief='flat', cursor='hand2',
-            font=("Microsoft YaHei", 11, "bold"), width=8,
+            font=("Microsoft YaHei", 14, "bold"), width=8,
             activebackground='#1565c0', activeforeground='white',
-            bd=0, pady=4).pack(side='right', padx=(0, 4), pady=8)
+            bd=0, pady=3, height=1).pack(side='right', padx=(0, 4), pady=10)
 
         # 加载历史记录
         self._render_private_history(user)
@@ -1595,8 +1641,8 @@ class MultiClientLauncher:
         chat_window.configure(bg='#eceff1')
 
         # 输入框使用固定像素高度
-        entry_font = ("Microsoft YaHei", 10)
-        entry_h = _font_height(chat_window, entry_font)
+        entry_font = ("Microsoft YaHei", 14)
+        entry_h = _font_height(chat_window, entry_font) + 6
 
         # ── 持久化历史记录 ────────────────────────────────────
         group_history = []
@@ -1624,8 +1670,21 @@ class MultiClientLauncher:
         tk.Label(top, text=f"  {username}",
             font=("Microsoft YaHei", 15, "bold"),
             bg='#1976d2', fg='white').pack(side='left', pady=14)
-        tk.Label(top, text="● 在线",
-            font=("Arial", 10), bg='#1976d2', fg='#90ee90').pack(side='left', padx=8, pady=14)
+
+        # 状态选择按钮
+        status_btn = tk.Label(top, text="● 在线",
+            font=("Arial", 10), bg='#1976d2', fg='#90ee90',
+            cursor='hand2')
+        status_btn.pack(side='left', padx=8, pady=14)
+
+        def show_status_menu(event):
+            menu = tk.Menu(chat_window, tearoff=0)
+            for s, c, t in [('online', '#90ee90', '● 在线'), ('busy', '#ff9800', '● 忙碌'), ('invisible', '#9e9e9e', '● 隐身')]:
+                menu.add_command(label=t, foreground=c, command=lambda ss=s, cc=c, tt=t: (status_btn.config(text=tt, fg=cc), client.send_message({'type': 'change_status', 'status': ss})))
+            menu.tk_popup(event.x_root, event.y_root)
+
+        status_btn.bind('<Button-1>', show_status_menu)
+
         tk.Button(top, text="刷新用户", command=client.request_online_users,
             bg='#e3e8ee', fg='#546e7a', relief='flat', cursor='hand2',
             font=("Microsoft YaHei", 9), activebackground='#b0bec5',
@@ -1685,17 +1744,17 @@ class MultiClientLauncher:
         g_input_frame = tk.Frame(group_view, bg='white', height=entry_h)
         g_input_frame.pack(fill='x', side='bottom', padx=10, pady=(0, 10))
         g_input_frame.pack_propagate(False)
-        g_input = tk.Entry(g_input_frame, font=("Microsoft YaHei", 10),
+        g_input = tk.Entry(g_input_frame, font=("Microsoft YaHei", 14),
             bg='#f8f8f8', fg='#333333', insertbackground='#1976d2',
-            relief='solid', bd=1, highlightthickness=1,
-            highlightcolor='#2196f3', highlightbackground='#e0e0e0')
-        g_input.pack(side='left', fill='x', expand=True, ipady=0,
-            padx=(10, 6), pady=(7, 7))
+            relief='flat', bd=0,
+            highlightthickness=2, highlightcolor='#2196f3')
+        g_input.pack(side='left', fill='x', expand=True, ipady=5,
+            padx=(10, 6), pady=(2, 2))
         g_send_btn = tk.Button(g_input_frame, text="发 送",
             bg='#2196f3', fg='white', relief='flat', cursor='hand2',
-            font=("Microsoft YaHei", 10, "bold"), width=8,
-            activebackground='#1565c0', activeforeground='white', bd=0, pady=7)
-        g_send_btn.pack(side='right', padx=(0, 4), pady=7)
+            font=("Microsoft YaHei", 14, "bold"), width=8,
+            activebackground='#1565c0', activeforeground='white', bd=0, pady=3, height=1)
+        g_send_btn.pack(side='right', padx=(0, 4), pady=10)
 
         # ── 发送保护：防止 Enter 和按钮同时触发导致重复发送 ───────────────────
         _sending_guard = [False]
@@ -1780,45 +1839,55 @@ class MultiClientLauncher:
             render_group()
 
         def render_group():
-            g_chat.config(state='normal')
-            g_chat.delete(1.0, 'end')
-            for m in group_history:
-                ts = m.get('timestamp', '')
-                sender = m.get('from', '')
-                content = m.get('content', '')
-                mt = m.get('type', '')
-                if mt == 'system':
-                    g_chat.insert('end', f"[{ts}] *** {content} ***\n\n", ('system', 'timestamp'))
-                else:
-                    g_chat.insert('end', f"[{ts}] ", ('timestamp'))
-                    g_chat.insert('end', f"{sender}", ('sender'))
-                    g_chat.insert('end', f": {content}\n\n", ('group'))
-            g_chat.see('end')
-            g_chat.config(state='disabled')
+            try:
+                if not g_chat.winfo_exists():
+                    return
+                g_chat.config(state='normal')
+                g_chat.delete(1.0, 'end')
+                for m in group_history:
+                    ts = m.get('timestamp', '')
+                    sender = m.get('from', '')
+                    content = m.get('content', '')
+                    mt = m.get('type', '')
+                    if mt == 'system':
+                        g_chat.insert('end', f"[{ts}] *** {content} ***\n\n", ('system', 'timestamp'))
+                    else:
+                        g_chat.insert('end', f"[{ts}] ", ('timestamp'))
+                        g_chat.insert('end', f"{sender}", ('sender'))
+                        g_chat.insert('end', f": {content}\n\n", ('group'))
+                g_chat.see('end')
+                g_chat.config(state='disabled')
+            except Exception:
+                pass  # 窗口已关闭
 
         # 私聊消息区 ScrolledText 的引用（mutable，open_private_chat 打开时赋值）
         p_area_ref = [None]
 
         def _render_priv(p_area, target):
             """渲染指定联系人的私聊历史到 ScrolledText"""
-            hist = private_histories.get(target, [])
-            p_area.config(state='normal')
-            p_area.delete(1.0, 'end')
-            for m in hist:
-                ts = m.get('timestamp', '')
-                s = m.get('from', '')
-                t = m.get('to', '')
-                c = m.get('content', '')
-                if s == username:
-                    p_area.insert('end', f"[{ts}] ", ('timestamp'))
-                    p_area.insert('end', f"[我 -> {t}]", ('private_sender'))
-                    p_area.insert('end', f": {c}\n\n", ('private'))
-                else:
-                    p_area.insert('end', f"[{ts}] ", ('timestamp'))
-                    p_area.insert('end', f"[{s} -> 我]", ('private_receiver'))
-                    p_area.insert('end', f": {c}\n\n", ('private'))
-            p_area.see('end')
-            p_area.config(state='disabled')
+            try:
+                if not p_area.winfo_exists():
+                    return
+                hist = private_histories.get(target, [])
+                p_area.config(state='normal')
+                p_area.delete(1.0, 'end')
+                for m in hist:
+                    ts = m.get('timestamp', '')
+                    s = m.get('from', '')
+                    t = m.get('to', '')
+                    c = m.get('content', '')
+                    if s == username:
+                        p_area.insert('end', f"[{ts}] ", ('timestamp'))
+                        p_area.insert('end', f"[我 -> {t}]", ('private_sender'))
+                        p_area.insert('end', f": {c}\n\n", ('private'))
+                    else:
+                        p_area.insert('end', f"[{ts}] ", ('timestamp'))
+                        p_area.insert('end', f"[{s} -> 我]", ('private_receiver'))
+                        p_area.insert('end', f": {c}\n\n", ('private'))
+                p_area.see('end')
+                p_area.config(state='disabled')
+            except Exception:
+                pass  # 窗口已关闭
 
         def append_private_msg(msg, msg_id=''):
             """追加私聊消息（基于消息 ID / 内容去重）"""
@@ -1851,19 +1920,37 @@ class MultiClientLauncher:
                 widget.destroy()
             has_users = False
             for u in online_users:
-                if u == username:
+                if isinstance(u, dict):
+                    uname = u.get('username', '')
+                    is_online = u.get('is_online', False)
+                    status = u.get('status', 'online')
+                else:
+                    uname = u
+                    is_online = True
+                    status = 'online'
+                if uname == username:
                     continue
                 has_users = True
-                unread = unread_counts.get(u, 0)
-                is_active = (u == active_private_user[0])
+                unread = unread_counts.get(uname, 0)
+                is_active = (uname == active_private_user[0])
                 bg = '#e3f2fd' if is_active else '#f5f5f5'
-                fg = '#1565c0' if is_active else '#2e7d32'
+                if is_active:
+                    fg = '#1565c0'
+                elif is_online:
+                    if status == 'busy':
+                        fg = '#ff9800'
+                    elif status == 'invisible':
+                        fg = '#9e9e9e'
+                    else:
+                        fg = '#2e7d32'
+                else:
+                    fg = '#9e9e9e'
                 row = tk.Frame(p_users_inner, bg=bg)
                 row.pack(fill='x', pady=1)
-                lbl = tk.Label(row, text=f"  {u}", font=("Microsoft YaHei", 10),
+                lbl = tk.Label(row, text=f"  {uname}", font=("Microsoft YaHei", 10),
                     bg=bg, fg=fg, cursor='hand2', anchor='w')
                 lbl.pack(side='left', fill='x', expand=True, ipady=6)
-                lbl.bind('<Button-1>', lambda e, u=u: open_private_chat(u))
+                lbl.bind('<Button-1>', lambda e, u=uname: open_private_chat(u))
                 lbl.bind('<Enter>', lambda e, l=lbl: l.config(bg='#e8f5e9'))
                 lbl.bind('<Leave>', lambda e, l=lbl, b=bg: l.config(bg=b))
                 if unread > 0:
@@ -1879,6 +1966,7 @@ class MultiClientLauncher:
             client.clear_unread(target)
             online_users = getattr(client, 'online_users', [])
             refresh_user_buttons(online_users)
+            update_priv_badge()
 
             for w in priv_right.pack_slaves():
                 w.destroy()
@@ -1915,12 +2003,12 @@ class MultiClientLauncher:
             p_input_f = tk.Frame(priv_right, bg='white', height=entry_h)
             p_input_f.pack(fill='x', padx=10, pady=(0, 10))
             p_input_f.pack_propagate(False)
-            p_input = tk.Entry(p_input_f, font=("Microsoft YaHei", 10),
+            p_input = tk.Entry(p_input_f, font=("Microsoft YaHei", 14),
                 bg='#f8f8f8', fg='#333333', insertbackground='#1976d2',
-                relief='solid', bd=1, highlightthickness=1,
-                highlightcolor='#2196f3', highlightbackground='#e0e0e0')
-            p_input.pack(side='left', fill='x', expand=True, ipady=0,
-                padx=(10, 6), pady=(7, 7))
+                relief='flat', bd=0,
+                highlightthickness=2, highlightcolor='#2196f3')
+            p_input.pack(side='left', fill='x', expand=True, ipady=5,
+                padx=(10, 6), pady=(2, 2))
 
             # 私聊发送保护：防止 Enter 和按钮同时触发导致重复发送
             _priv_sending = [False]
@@ -1947,9 +2035,9 @@ class MultiClientLauncher:
             p_input.bind('<Return>', lambda e: send_priv())
             p_send_btn = tk.Button(p_input_f, text="发 送", command=send_priv,
                 bg='#2196f3', fg='white', relief='flat', cursor='hand2',
-                font=("Microsoft YaHei", 11, "bold"), width=8,
-                activebackground='#1565c0', activeforeground='white', bd=0, pady=4)
-            p_send_btn.pack(side='right', padx=(0, 4), pady=8)
+                font=("Microsoft YaHei", 14, "bold"), width=8,
+                activebackground='#1565c0', activeforeground='white', bd=0, pady=3, height=1)
+            p_send_btn.pack(side='right', padx=(0, 4), pady=10)
 
             _render_priv(p_area_ref[0], target)
 
@@ -2010,24 +2098,33 @@ class MultiClientLauncher:
                     unread_counts[other] = unread_counts.get(other, 0) + 1
                     online_users = getattr(client, 'online_users', [])
                     refresh_user_buttons(online_users)
+                    update_priv_badge()
             elif mt == 'system':
                 add_group_msg(msg)
-            elif mt == 'online_users':
+            elif mt == 'online_users' or mt == 'user_list':
                 online = msg.get('users', [])
-                client.online_users = online
-                refresh_user_buttons(online)
+                user_list = []
+                for u in online:
+                    if isinstance(u, dict):
+                        user_list.append(u)
+                    else:
+                        user_list.append({'username': u, 'is_online': True, 'status': 'online'})
+                client.online_users = user_list
+                refresh_user_buttons(user_list)
             elif mt == 'unread_increment':
                 sender = msg.get('from', '')
                 if sender != active_private_user[0]:
                     unread_counts[sender] = unread_counts.get(sender, 0) + 1
                     online_users = getattr(client, 'online_users', [])
                     refresh_user_buttons(online_users)
+                    update_priv_badge()
             elif mt == 'unread_counts':
                 counts = msg.get('counts', {})
                 unread_counts.clear()
                 unread_counts.update(counts)
                 online_users = getattr(client, 'online_users', [])
                 refresh_user_buttons(online_users)
+                update_priv_badge()
             elif mt in ('group_history', 'private_history'):
                 msgs = msg.get('messages', [])
                 mt2 = 'group' if mt == 'group_history' else 'private'
@@ -2058,6 +2155,13 @@ class MultiClientLauncher:
 
         # 设置回调
         client.set_message_callback(dispatch_message)
+
+        # 设置用户列表回调
+        def on_user_list_update(users):
+            client.online_users = users
+            refresh_user_buttons(users)
+
+        client.set_online_users_callback(on_user_list_update)
         client.username = username
         client.window = chat_window
         client._chat_window = chat_window
